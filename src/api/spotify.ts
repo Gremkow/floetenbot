@@ -124,6 +124,10 @@ export async function searchForTrack(query: string): Promise<Track[] | null> {
     // eslint-disable-next-line prefer-destructuring
     query = query.split("(")[0]
   }
+  if (query.includes("[")) {
+    // eslint-disable-next-line prefer-destructuring
+    query = query.split("[")[0]
+  }
   const token = await getToken()
   const { data } = await axios.get<{ tracks: { items: Track[] } }>(
     `https://api.spotify.com/v1/search/?q=${encodeURI(query)}&type=track&limit=1`,

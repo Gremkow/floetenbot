@@ -1,10 +1,37 @@
 import Discord from "discord.js"
-// import ytdl from "ytdl-core-discord"
-import ytdl from "discord-ytdl-core"
-import { getVideoInfo, getVideoUrl } from "../api/youtube"
+import ytdlDiscord from "discord-ytdl-core"
+// import fs from "fs"
+// import path from "path"
+// import ffmpeg from "fluent-ffmpeg"
+// import readline from "readline"
+import { getHackyVideoId, getVideoInfo } from "../api/youtube"
 import logger from "../utils/logger"
 import { Server, Song, store } from ".."
 import { getSongQueries, searchForTrack } from "../api/spotify"
+import { shuffleArray } from "../utils/utils"
+
+export async function shuffle(message: Discord.Message) {
+  message.channel.startTyping()
+
+  const voiceChannel = message.member?.voice.channel
+  if (!voiceChannel) {
+    await message.channel.send("Du befindest dich nicht in einem Voice Channel du Mongo")
+    message.channel.stopTyping()
+    return
+  }
+  if (!message.guild) {
+    await message.channel.send("Gilde nicht definiert")
+    message.channel.stopTyping()
+    return
+  }
+
+  const server = store.get(message.guild.id)
+  if (server && server.songs && server.songs.length > 1) {
+    shuffleArray(server.songs)
+  }
+  message.channel.stopTyping()
+  await message.react("🔀")
+}
 
 export async function start(message: Discord.Message, args: string[]) {
   message.channel.startTyping()
@@ -69,10 +96,10 @@ export async function start(message: Discord.Message, args: string[]) {
       }
     } else {
       // normal search terms
-      const item = await getVideoUrl(args.join(" "))
+      const item = await getHackyVideoId(args.join(" "))
       const song: Song = {
-        title: item.snippet.title,
-        url: `https://www.youtube.com/watch?v=${item.id.videoId}`,
+        title: item.name,
+        url: `https://www.youtube.com/watch?v=${item.id}`,
       }
       songs.push(song)
     }
@@ -93,7 +120,7 @@ export async function start(message: Discord.Message, args: string[]) {
     store.set(message.guild.id, newServer)
     try {
       const connection = await voiceChannel.join()
-      connection.voice.setSelfDeaf(true)
+      connection.voice?.setSelfDeaf(true)
       newServer.connection = connection
       await play(message.guild.id, songs[0])
     } catch (error) {
@@ -120,7 +147,13 @@ export async function play(guildId: string, song: Song) {
   }
   if (!song) {
     // queue empty
-    server?.voiceChannel?.leave()
+    if (server.connection) {
+      if (server.connection.dispatcher) {
+        console.log("destroying dispatcher")
+        server.connection.dispatcher.destroy()
+      }
+      server.connection.disconnect()
+    }
     store.delete(guildId)
     return
   }
@@ -129,22 +162,36 @@ export async function play(guildId: string, song: Song) {
     return
   }
   if (!song.url) {
-    const item = await getVideoUrl(song.title)
-    song.title = item.snippet.title
-    song.url = `https://www.youtube.com/watch?v=${item.id.videoId}`
+    const item = await getHackyVideoId(song.title)
+    song.title = item.name
+    song.url = `https://www.youtube.com/watch?v=${item.id}`
   }
-  const stream = ytdl(song.url, {
+
+  const stream = ytdlDiscord(song.url!, {
     filter: "audioonly",
     opusEncoded: true,
-    highWaterMark: 33554432,
-    encoderArgs: ["-af", "bass=g=15,dynaudnorm=g=301"],
+    dlChunkSize: 0,
   })
+    .on("close", () => {
+      console.log("ytdl stream closed")
+      stream?.destroy()
+    })
+    .on("end", () => {
+      console.log("yctdl stream ended")
+      stream?.destroy()
+    })
+    .on("error", (err: Error) => {
+      console.log("ytdl stream error", err.message)
+      stream?.destroy()
+    })
+
   server.connection
     .play(stream, {
       type: "opus",
-      highWaterMark: 50,
     })
     .on("finish", async () => {
+      stream?.destroy()
+      server.connection?.dispatcher?.destroy()
       server.songs.shift()
       if (!server.songs[0] && server.connection) {
         console.log("getting recommends because last song")
@@ -166,7 +213,20 @@ export async function play(guildId: string, song: Song) {
       }
       play(guildId, server.songs[0])
     })
-    .on("error", (error) => logger.error(error))
+    .on("error", (error) => {
+      logger.error(error)
+      server.connection?.dispatcher?.destroy()
+      stream?.destroy()
+    })
+    .on("close", () => {
+      console.log("destroying stream")
+      logger.error("connection on close")
+      stream?.destroy()
+      server.connection?.dispatcher?.destroy()
+    })
+    .on("debug", (info) => {
+      logger.error("DEBUG", info)
+    })
   await server.textChannel.send(`Los geht's mit ${song.title}`)
 }
 
@@ -176,20 +236,15 @@ export async function stop(message: Discord.Message) {
     return
   }
   const server = store.get(message.guild?.id as string) as Server
-  server.songs = []
-  await server.voiceChannel.leave()
+  if (server.connection) {
+    if (server.connection.dispatcher) {
+      console.log("destroying dispatcher")
+      server.connection.dispatcher.destroy()
+    }
+    server.connection.disconnect()
+  }
   store.delete(message.guild?.id as string)
   await message.react("🟥")
-}
-
-export async function pause(message: Discord.Message) {
-  if (!message.member?.voice.channel) {
-    await message.channel.send("Du befindest dich nicht in einem Voice Channel du Mongo")
-    return
-  }
-  const server = store.get(message.guild?.id as string) as Server
-  server.connection?.dispatcher.pause()
-  await message.react("⏸")
 }
 
 export async function skip(message: Discord.Message) {
@@ -204,48 +259,6 @@ export async function skip(message: Discord.Message) {
   }
   // ending current dispatcher triggers the on end hook which plays the next song
   server.connection?.dispatcher.end()
-}
-
-export async function leave(message: Discord.Message) {
-  const server = store.get(message.guild?.id as string) as Server
-  if (server.voiceChannel) {
-    store.delete(message.guild?.id as string)
-    await server.voiceChannel.leave()
-    await message.react("👋")
-  }
-}
-
-export async function queueFull(message: Discord.Message) {
-  const server = store.get(message.guild?.id as string)
-  if (!server) {
-    await message.channel.send("Grade läuft doch gar nichts")
-  } else if (server.songs.length === 0) {
-    await message.channel.send("Nichts in der queue")
-  } else {
-    const fields: Discord.EmbedFieldData[] = [{ name: "Aktueller Titel", value: `1) ${server.songs[0].title}` }]
-    if (server.songs.length > 1) {
-      let text = ""
-      for (let i = 1; i < server.songs.length; i++) {
-        const song = server.songs[i]
-        const songTitle = `${i + 1}) ${song.title}`
-        text += `${songTitle}\n`
-        if (i % 9 === 0) {
-          fields.push({ name: `Als nächstes`, value: text })
-          text = ""
-        } else if (i === server.songs.length - 1) {
-          fields.push({ name: `Als nächstes`, value: text })
-        }
-      }
-    }
-    const queueMessage = new Discord.MessageEmbed()
-      .setColor("#0099ff")
-      .setTitle("Ganze Queue")
-      .setDescription("Du kannst '_jump X' benutzen um zur Nummer X zu skippen")
-      .addFields(...fields)
-      .setTimestamp()
-      .setFooter("Flötenbot bester Bot")
-    await message.channel.send(queueMessage)
-  }
 }
 
 export async function queue(message: Discord.Message) {
@@ -301,4 +314,38 @@ export async function jump(message: Discord.Message, args: string[]) {
     server.songs.splice(0, position - 2)
     server.connection?.dispatcher.end()
   }
+}
+
+export async function help(message: Discord.Message) {
+  const fields = [
+    {
+      name: "_play query|youtube|spotify",
+      value:
+        "Spielt den Youtube/Spotify Link ab oder sucht auf Youtube nach dem Begriff. Wenn schon etwas läuft kommt das in die Queue.",
+    },
+    {
+      name: "_stop",
+      value: "Stoppt die Wiedergabe und der Bot verlässt den Channel.",
+    },
+    {
+      name: "_skip",
+      value: "Skippt zum nächsten Lied. Wenn nichts in der Queue ist verlässt der Bot den Channel.",
+    },
+    {
+      name: "_queue",
+      value: "Zeigt die nächsten Lieder in der Queue an.",
+    },
+    {
+      name: "_jump X",
+      value: "Springt zur Position X in der Queue.",
+    },
+  ]
+  const helpMessage = new Discord.MessageEmbed()
+    .setColor("#0099ff")
+    .setTitle("Tipps")
+    .setDescription("Diese Commands kannst du benutzen:")
+    .addFields(...fields)
+    .setTimestamp()
+    .setFooter("Flötenbot bester Bot")
+  await message.channel.send(helpMessage)
 }

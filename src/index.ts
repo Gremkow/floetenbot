@@ -1,6 +1,7 @@
 import Discord from "discord.js"
 import { TOKEN } from "./config"
 import { onMessage } from "./handlers/message"
+// import { onVoiceStateUpdate } from "./handlers/voiceStateUpdate"
 import logger from "./utils/logger"
 
 export interface Server {
@@ -20,7 +21,10 @@ export const store = new Map<string, Server>()
 
 const client = new Discord.Client()
 
-client.on("ready", () => logger.log("info", "The bot is online!"))
+client.on("ready", () => {
+  logger.log("info", "The bot is online!")
+  client.user?.setActivity("_help for help", { type: "WATCHING" })
+})
 client.on("debug", (m) => logger.log("debug", m))
 client.on("warn", (m) => logger.log("warn", m))
 client.on("error", (m) => logger.log("error", m))
